@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  claude-peers server-mode broker as a macOS launchd service.
+
+  1. Replace YOURUSER with your username (and adjust the bun path if needed).
+  2. Create ~/.claude-peers.json on this machine with bind/broker_url/token/host
+     (see README "Server mode").
+  3. Install:
+       cp examples/com.claude-peers.broker.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.claude-peers.broker.plist
+  4. Verify:
+       curl -s -H "Authorization: Bearer <token>" http://<bind-address>:7899/health
+
+  On Linux, an equivalent systemd user unit works the same way:
+  ExecStart=/path/to/bun /path/to/claude-peers/broker.ts, Restart=always.
+
+  Note: the macOS Application Firewall can silently block inbound connections
+  to bun. If remote machines can't reach the broker, allow bun in
+  System Settings → Network → Firewall, or via socketfilterfw.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.claude-peers.broker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/YOURUSER/.bun/bin/bun</string>
+    <string>/Users/YOURUSER/claude-peers-mcp/broker.ts</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>/Users/YOURUSER/.claude-peers-broker.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOURUSER/.claude-peers-broker.log</string>
+</dict>
+</plist>

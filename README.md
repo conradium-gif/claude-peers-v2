@@ -2,6 +2,11 @@
 
 Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others by name and send messages that **reliably arrive** — no experimental flags, no lost mail.
 
+Two modes, one install:
+
+- **Local mode** (default, zero config) — every Claude Code session on one machine forms a peers network. Nothing to set up beyond the install.
+- **Server mode** (v2.5+) — got a home server or an always-on machine? Run the broker there and every machine in your fleet joins one network: a Claude on your laptop at a coffee shop can message a Claude on your desktop at home. See [Server mode](#server-mode--one-peers-network-across-all-your-machines-v25).
+
 ```
   Terminal 1 (multi-baton)           Terminal 2 (baton-term)
   ┌────────────────────────┐         ┌──────────────────────────┐
@@ -115,9 +120,9 @@ bun cli.ts send <name> <msg>   # send a message into a Claude session (by name o
 bun cli.ts kill-broker         # stop the broker (listener only!)
 ```
 
-## Hub mode — one peers network across multiple machines (v2.5)
+## Server mode — one peers network across all your machines (v2.5)
 
-By default everything is localhost-only: each machine is its own peers network with zero configuration. Hub mode connects them: run the broker on one always-on machine (bound to a private network address — Tailscale is ideal) and point every machine's components at it. Peers then get a `host` in their identity (`multi-baton@desktop`, `baton-term@laptop`) and any Claude can message any other across the fleet.
+By default everything is localhost-only: each machine is its own peers network with zero configuration. Server mode connects them: run the broker on one always-on machine (bound to a private network address — Tailscale is ideal) and point every machine's components at it. Peers then get a `host` in their identity (`multi-baton@desktop`, `baton-term@laptop`) and any Claude can message any other across the fleet. A launchd template for the server machine is in [`examples/`](examples/).
 
 Create `~/.claude-peers.json` on each machine (this file is used instead of env vars because macOS GUI-spawned hooks don't reliably inherit shell environments):
 

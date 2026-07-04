@@ -3,14 +3,19 @@ export type PeerId = string;
 
 export interface Peer {
   id: PeerId;
+  name: string;
   pid: number;
+  claude_pid: number | null;
   cwd: string;
   git_root: string | null;
   tty: string | null;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  pending?: number; // queued messages waiting for this peer
 }
+
+export type MessageStatus = "queued" | "delivered";
 
 export interface Message {
   id: number;
@@ -18,13 +23,21 @@ export interface Message {
   to_id: PeerId;
   text: string;
   sent_at: string; // ISO timestamp
-  delivered: boolean;
+  status: MessageStatus;
+  delivered_at: string | null;
+}
+
+export interface DeliveredMessage extends Message {
+  from_name: string;
+  from_cwd: string;
+  from_summary: string;
 }
 
 // --- Broker API types ---
 
 export interface RegisterRequest {
   pid: number;
+  claude_pid: number | null;
   cwd: string;
   git_root: string | null;
   tty: string | null;
@@ -33,6 +46,7 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  name: string;
 }
 
 export interface HeartbeatRequest {
@@ -54,14 +68,40 @@ export interface ListPeersRequest {
 
 export interface SendMessageRequest {
   from_id: PeerId;
-  to_id: PeerId;
+  to: string; // peer id OR peer name
   text: string;
 }
 
-export interface PollMessagesRequest {
-  id: PeerId;
+export interface SendMessageResponse {
+  ok: boolean;
+  error?: string;
+  message_id?: number;
+  to_id?: PeerId;
+  to_name?: string;
+  target_last_seen?: string;
 }
 
-export interface PollMessagesResponse {
-  messages: Message[];
+export interface ConsumeRequest {
+  peer_id: PeerId;
+}
+
+export interface ConsumeResponse {
+  messages: DeliveredMessage[];
+}
+
+export interface FindPeerRequest {
+  claude_pids: number[];
+}
+
+export interface MessageStatusRequest {
+  message_id: number;
+}
+
+export interface MessageStatusResponse {
+  found: boolean;
+  status?: MessageStatus;
+  sent_at?: string;
+  delivered_at?: string | null;
+  to_id?: PeerId;
+  to_name?: string;
 }

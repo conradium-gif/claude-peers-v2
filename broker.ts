@@ -1,9 +1,19 @@
 #!/usr/bin/env bun
 /**
- * claude-peers broker daemon
+ * claude-peers broker daemon (v2)
  *
  * A singleton HTTP server on localhost:7899 backed by SQLite.
- * Tracks all registered Claude Code peers and routes messages between them.
+ * Tracks all registered Claude Code peers and queues messages between them.
+ *
+ * v2 delivery model:
+ *   - Messages stay `queued` until a hook in the *receiving* session calls
+ *     /consume — which happens only when the message is actually injected
+ *     into that session's context. No more fire-and-forget.
+ *   - /poll-messages (v1) is deprecated and always returns []. This keeps
+ *     still-running v1 MCP servers from destroying queued mail.
+ *   - Peers get stable friendly names (from their repo/directory name).
+ *   - If a message sits queued for >90s, the broker raises a macOS
+ *     notification so the human knows a session is idle with mail waiting.
  *
  * Auto-launched by the MCP server if not already running.
  * Run directly: bun broker.ts
@@ -17,14 +27,21 @@ import type {
   SetSummaryRequest,
   ListPeersRequest,
   SendMessageRequest,
-  PollMessagesRequest,
-  PollMessagesResponse,
+  SendMessageResponse,
+  ConsumeRequest,
+  ConsumeResponse,
+  FindPeerRequest,
+  MessageStatusRequest,
+  MessageStatusResponse,
   Peer,
-  Message,
+  DeliveredMessage,
 } from "./shared/types.ts";
+
+export const BROKER_VERSION = "0.2.0";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const STALE_NOTIFY_MS = 90_000;
 
 // --- Database setup ---
 
@@ -52,77 +69,112 @@ db.run(`
     to_id TEXT NOT NULL,
     text TEXT NOT NULL,
     sent_at TEXT NOT NULL,
-    delivered INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (from_id) REFERENCES peers(id),
-    FOREIGN KEY (to_id) REFERENCES peers(id)
+    delivered INTEGER NOT NULL DEFAULT 0
   )
 `);
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// v1 → v2 schema migration (additive, safe to re-run)
+function ensureColumn(table: string, col: string, ddl: string) {
+  const cols = db.query(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === col)) {
+    db.run(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+ensureColumn("peers", "name", "name TEXT NOT NULL DEFAULT ''");
+ensureColumn("peers", "claude_pid", "claude_pid INTEGER");
+ensureColumn("messages", "status", "status TEXT NOT NULL DEFAULT 'queued'");
+ensureColumn("messages", "delivered_at", "delivered_at TEXT");
+ensureColumn("messages", "notified", "notified INTEGER NOT NULL DEFAULT 0");
+
+// Backfill status from the v1 `delivered` flag
+db.run(`UPDATE messages SET status = 'delivered' WHERE delivered = 1 AND status = 'queued'`);
+
+// --- Friendly names ---
+
+function baseName(peer: { cwd: string; git_root: string | null }): string {
+  const source = peer.git_root ?? peer.cwd;
+  const base = source.split("/").filter(Boolean).pop() ?? "peer";
+  return base.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "peer";
+}
+
+function uniqueName(desired: string, excludeId?: string): string {
+  const taken = new Set(
+    (db.query("SELECT name FROM peers WHERE id != ?").all(excludeId ?? "") as { name: string }[])
+      .map((r) => r.name)
+      .filter(Boolean)
+  );
+  if (!taken.has(desired)) return desired;
+  for (let i = 2; ; i++) {
+    const candidate = `${desired}-${i}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
+// Backfill names for peers registered under v1
+{
+  const unnamed = db.query("SELECT id, cwd, git_root FROM peers WHERE name = ''").all() as {
+    id: string;
+    cwd: string;
+    git_root: string | null;
+  }[];
+  for (const p of unnamed) {
+    db.run("UPDATE peers SET name = ? WHERE id = ?", [uniqueName(baseName(p), p.id), p.id]);
+  }
+}
+
+// --- Stale peer cleanup ---
+
+// Signal 0 checks existence without killing. Only ESRCH means the process
+// is gone — EPERM (e.g. under a sandbox) means it exists but we can't
+// signal it, and treating that as "dead" would wipe live peers.
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    if (!processAlive(peer.pid)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      db.run("DELETE FROM messages WHERE to_id = ? AND status = 'queued'", [peer.id]);
     }
   }
 }
 
 cleanStalePeers();
-
-// Periodically clean stale peers (every 30s)
 setInterval(cleanStalePeers, 30_000);
 
-// --- Prepared statements ---
+// --- Stale-message escalation (human notification) ---
 
-const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-`);
+function notifyStaleMessages() {
+  const cutoff = new Date(Date.now() - STALE_NOTIFY_MS).toISOString();
+  const stale = db
+    .query(
+      `SELECT m.id, m.text, p.name AS to_name FROM messages m
+       LEFT JOIN peers p ON p.id = m.to_id
+       WHERE m.status = 'queued' AND m.notified = 0 AND m.sent_at < ?`
+    )
+    .all(cutoff) as { id: number; text: string; to_name: string | null }[];
+  for (const m of stale) {
+    const target = m.to_name ?? "unknown peer";
+    const preview = m.text.slice(0, 80).replace(/["\\\n]/g, " ");
+    Bun.spawn([
+      "osascript",
+      "-e",
+      `display notification "${preview}" with title "claude-peers" subtitle "Message waiting for idle session: ${target}"`,
+    ]);
+    db.run("UPDATE messages SET notified = 1 WHERE id = ?", [m.id]);
+  }
+}
 
-const updateLastSeen = db.prepare(`
-  UPDATE peers SET last_seen = ? WHERE id = ?
-`);
+setInterval(notifyStaleMessages, 30_000);
 
-const updateSummary = db.prepare(`
-  UPDATE peers SET summary = ? WHERE id = ?
-`);
-
-const deletePeer = db.prepare(`
-  DELETE FROM peers WHERE id = ?
-`);
-
-const selectAllPeers = db.prepare(`
-  SELECT * FROM peers
-`);
-
-const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ?
-`);
-
-const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ?
-`);
-
-const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
-`);
-
-const selectUndelivered = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
-`);
-
-const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
-`);
-
-// --- Generate peer ID ---
+// --- Request handlers ---
 
 function generateId(): string {
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -133,94 +185,166 @@ function generateId(): string {
   return id;
 }
 
-// --- Request handlers ---
-
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  const name = uniqueName(baseName(body));
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-  if (existing) {
-    deletePeer.run(existing.id);
+  // Re-registration: same MCP-server PID, or same parent Claude process
+  // (MCP server was restarted). Migrate queued mail to the new identity.
+  const existing = db
+    .query("SELECT id FROM peers WHERE pid = ?1 OR (claude_pid IS NOT NULL AND claude_pid = ?2)")
+    .all(body.pid, body.claude_pid) as { id: string }[];
+
+  db.run(
+    `INSERT INTO peers (id, name, pid, claude_pid, cwd, git_root, tty, summary, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, name, body.pid, body.claude_pid, body.cwd, body.git_root, body.tty, body.summary, now, now]
+  );
+
+  for (const old of existing) {
+    db.run("UPDATE messages SET to_id = ? WHERE to_id = ? AND status = 'queued'", [id, old.id]);
+    db.run("DELETE FROM peers WHERE id = ?", [old.id]);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
-  return { id };
+  return { id, name };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+  db.run("UPDATE peers SET last_seen = ? WHERE id = ?", [new Date().toISOString(), body.id]);
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
-  updateSummary.run(body.summary, body.id);
+  db.run("UPDATE peers SET summary = ? WHERE id = ?", [body.summary, body.id]);
+}
+
+function withPending(peers: Peer[]): Peer[] {
+  return peers.map((p) => {
+    const row = db
+      .query("SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND status = 'queued'")
+      .get(p.id) as { n: number };
+    return { ...p, pending: row.n };
+  });
 }
 
 function handleListPeers(body: ListPeersRequest): Peer[] {
   let peers: Peer[];
 
   switch (body.scope) {
-    case "machine":
-      peers = selectAllPeers.all() as Peer[];
-      break;
     case "directory":
-      peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+      peers = db.query("SELECT * FROM peers WHERE cwd = ?").all(body.cwd) as Peer[];
       break;
     case "repo":
       if (body.git_root) {
-        peers = selectPeersByGitRoot.all(body.git_root) as Peer[];
+        peers = db.query("SELECT * FROM peers WHERE git_root = ?").all(body.git_root) as Peer[];
       } else {
-        // No git root, fall back to directory
-        peers = selectPeersByDirectory.all(body.cwd) as Peer[];
+        peers = db.query("SELECT * FROM peers WHERE cwd = ?").all(body.cwd) as Peer[];
       }
       break;
+    case "machine":
     default:
-      peers = selectAllPeers.all() as Peer[];
+      peers = db.query("SELECT * FROM peers").all() as Peer[];
   }
 
-  // Exclude the requesting peer
   if (body.exclude_id) {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
   // Verify each peer's process is still alive
-  return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
-    }
+  peers = peers.filter((p) => {
+    if (processAlive(p.pid)) return true;
+    db.run("DELETE FROM peers WHERE id = ?", [p.id]);
+    return false;
   });
+
+  return withPending(peers);
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
+  // v1 compat: accept `to_id` as alias for `to`
+  const to = body.to ?? (body as unknown as { to_id?: string }).to_id;
+  if (!to) return { ok: false, error: "Missing 'to' (peer id or name)" };
+
+  const target = db
+    .query("SELECT id, name, last_seen FROM peers WHERE id = ?1 OR lower(name) = lower(?1)")
+    .get(to) as { id: string; name: string; last_seen: string } | null;
   if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
+    const names = (db.query("SELECT name FROM peers").all() as { name: string }[])
+      .map((r) => r.name)
+      .join(", ");
+    return { ok: false, error: `Peer "${to}" not found. Known peers: ${names || "(none)"}` };
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
-  return { ok: true };
+  const result = db.run(
+    "INSERT INTO messages (from_id, to_id, text, sent_at, delivered, status) VALUES (?, ?, ?, ?, 0, 'queued')",
+    [body.from_id, target.id, body.text, new Date().toISOString()]
+  );
+
+  return {
+    ok: true,
+    message_id: Number(result.lastInsertRowid),
+    to_id: target.id,
+    to_name: target.name,
+    target_last_seen: target.last_seen,
+  };
 }
 
-function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+/**
+ * Atomically hand queued messages to the receiving session.
+ * Called by delivery hooks at the moment the text is injected into context —
+ * this is the only place messages transition queued → delivered.
+ */
+function handleConsume(body: ConsumeRequest): ConsumeResponse {
+  const tx = db.transaction((peerId: string) => {
+    const messages = db
+      .query(
+        `SELECT m.*, COALESCE(p.name, m.from_id) AS from_name,
+                COALESCE(p.cwd, '') AS from_cwd, COALESCE(p.summary, '') AS from_summary
+         FROM messages m LEFT JOIN peers p ON p.id = m.from_id
+         WHERE m.to_id = ? AND m.status = 'queued' ORDER BY m.sent_at ASC`
+      )
+      .all(peerId) as DeliveredMessage[];
+    const now = new Date().toISOString();
+    for (const m of messages) {
+      db.run("UPDATE messages SET status = 'delivered', delivered = 1, delivered_at = ? WHERE id = ?", [
+        now,
+        m.id,
+      ]);
+    }
+    return messages;
+  });
+  return { messages: tx(body.peer_id) };
+}
 
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
-  }
+/**
+ * Used by delivery hooks to figure out which peer their session is.
+ * The hook walks its process ancestry; one of those PIDs is the Claude
+ * process that also spawned the registered MCP server.
+ */
+function handleFindPeer(body: FindPeerRequest): { peer: Peer | null } {
+  if (!body.claude_pids?.length) return { peer: null };
+  const placeholders = body.claude_pids.map(() => "?").join(",");
+  const peer = db
+    .query(`SELECT * FROM peers WHERE claude_pid IN (${placeholders}) LIMIT 1`)
+    .get(...body.claude_pids) as Peer | null;
+  return { peer };
+}
 
-  return { messages };
+function handleMessageStatus(body: MessageStatusRequest): MessageStatusResponse {
+  const m = db
+    .query(
+      `SELECT m.status, m.sent_at, m.delivered_at, m.to_id, COALESCE(p.name, m.to_id) AS to_name
+       FROM messages m LEFT JOIN peers p ON p.id = m.to_id WHERE m.id = ?`
+    )
+    .get(body.message_id) as
+    | { status: "queued" | "delivered"; sent_at: string; delivered_at: string | null; to_id: string; to_name: string }
+    | null;
+  if (!m) return { found: false };
+  return { found: true, ...m };
 }
 
 function handleUnregister(body: { id: string }): void {
-  deletePeer.run(body.id);
+  db.run("DELETE FROM peers WHERE id = ?", [body.id]);
 }
 
 // --- HTTP Server ---
@@ -234,9 +358,10 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        const count = (db.query("SELECT COUNT(*) AS n FROM peers").get() as { n: number }).n;
+        return Response.json({ status: "ok", version: BROKER_VERSION, peers: count });
       }
-      return new Response("claude-peers broker", { status: 200 });
+      return new Response(`claude-peers broker v${BROKER_VERSION}`, { status: 200 });
     }
 
     try {
@@ -255,10 +380,22 @@ Bun.serve({
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
           return Response.json(handleSendMessage(body as SendMessageRequest));
-        case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/consume":
+          return Response.json(handleConsume(body as ConsumeRequest));
+        case "/find-peer":
+          return Response.json(handleFindPeer(body as FindPeerRequest));
+        case "/message-status":
+          return Response.json(handleMessageStatus(body as MessageStatusRequest));
         case "/unregister":
           handleUnregister(body as { id: string });
+          return Response.json({ ok: true });
+        case "/poll-messages":
+          // Deprecated v1 endpoint. v1 servers polled this every second and
+          // marked mail delivered before anyone read it. Returning [] keeps
+          // still-running v1 servers harmless; v2 hooks use /consume.
+          return Response.json({ messages: [] });
+        case "/shutdown":
+          setTimeout(() => process.exit(0), 100);
           return Response.json({ ok: true });
         default:
           return Response.json({ error: "not found" }, { status: 404 });
@@ -270,4 +407,4 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+console.error(`[claude-peers broker] v${BROKER_VERSION} listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);

@@ -113,13 +113,20 @@ switch (cmd) {
       process.exit(1);
     }
     try {
-      const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
+      const result = await brokerFetch<{
+        ok: boolean;
+        error?: string;
+        message_id?: number;
+        to_name?: string;
+      }>("/send-message", {
         from_id: "cli",
-        to_id: toId,
+        to: toId,
         text: msg,
       });
       if (result.ok) {
-        console.log(`Message sent to ${toId}`);
+        console.log(
+          `Message ${result.message_id} queued for "${result.to_name}" (delivered when their session is next active)`
+        );
       } else {
         console.error(`Failed: ${result.error}`);
       }
@@ -133,8 +140,10 @@ switch (cmd) {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
       console.log(`Broker has ${health.peers} peer(s). Shutting down...`);
-      // Find and kill the broker process on the port
-      const proc = Bun.spawnSync(["lsof", "-ti", `:${BROKER_PORT}`]);
+      // Find and kill the broker process on the port. -sTCP:LISTEN is
+      // load-bearing: without it lsof also lists clients connected to the
+      // port (every session's MCP server) and we'd kill them all.
+      const proc = Bun.spawnSync(["lsof", "-ti", `tcp:${BROKER_PORT}`, "-sTCP:LISTEN"]);
       const pids = new TextDecoder()
         .decode(proc.stdout)
         .trim()

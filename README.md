@@ -1,120 +1,131 @@
-# claude-peers
+# claude-peers v2
 
-Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
+Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others by name and send messages that **reliably arrive** — no experimental flags, no lost mail.
 
 ```
-  Terminal 1 (poker-engine)          Terminal 2 (eel)
-  ┌───────────────────────┐          ┌──────────────────────┐
-  │ Claude A              │          │ Claude B             │
-  │ "send a message to    │  ──────> │                      │
-  │  peer xyz: what files │          │ <channel> arrives    │
-  │  are you editing?"    │  <────── │  instantly, Claude B │
-  │                       │          │  responds            │
-  └───────────────────────┘          └──────────────────────┘
+  Terminal 1 (multi-baton)           Terminal 2 (baton-term)
+  ┌────────────────────────┐         ┌──────────────────────────┐
+  │ Claude A               │         │ Claude B                 │
+  │ "message baton-term:   │ ──────> │ 📨 hook injects message  │
+  │  which port are you    │         │    mid-turn / at turn    │
+  │  using?"               │ <────── │    end — B replies       │
+  │ message_status: ✅      │         │                          │
+  └────────────────────────┘         └──────────────────────────┘
 ```
 
-## Quick start
+## Why v2 exists
 
-### 1. Install
+v1 delivered messages by pushing them over the experimental `claude/channel` MCP capability — which Claude Code silently drops unless **every** session is launched with `--dangerously-load-development-channels`. Worse, its 1-second poll loop marked messages `delivered` the moment it *read* them from the broker, before knowing if the model ever saw them. Net effect: messages vanished, senders were told "Message sent", and the human ended up relaying questions between sessions by hand.
+
+v2 fixes delivery at the root:
+
+- **Hooks, not channels.** A tiny hook (`hooks/deliver.ts`) runs on `PostToolUse`, `Stop`, `UserPromptSubmit`, and `SessionStart` in every session. When mail is queued, it injects it into the session's context. Works in the terminal, the Desktop app, and headless runs — no flags.
+- **Messages can't be lost.** Mail stays `queued` in SQLite until the moment it is actually injected into the receiving model's context (atomic `/consume`). If a session is gone, mail waits or the broker tells the human.
+- **A Stop-hook that demands answers.** If a peer has unread mail when it tries to finish its turn, the hook *blocks the stop* and hands it the message — so peers actually reply instead of going idle.
+- **Honest senders.** `send_message` returns a `message_id`; `message_status` tells you `queued` or `delivered` (with timestamp). No more "sent!" fiction.
+- **Human escalation.** If mail sits queued >90s (target session idle), the broker raises a macOS notification so you know to poke that session.
+- **Friendly names.** Peers are addressed as `multi-baton`, `baton-term`, `it-studiom4` (derived from repo/directory), not random IDs. Case-insensitive.
+- **Re-registration keeps mail.** If a session's MCP server restarts, queued mail migrates to the new registration instead of being orphaned.
+
+## Install
 
 ```bash
-git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
+git clone <this-repo> ~/claude-peers-mcp
 cd ~/claude-peers-mcp
 bun install
 ```
 
-### 2. Register the MCP server
-
-This makes claude-peers available in every Claude Code session, from any directory:
+### 1. Register the MCP server (user scope — all projects)
 
 ```bash
 claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers-mcp/server.ts
 ```
 
-Replace `~/claude-peers-mcp` with wherever you cloned it.
+### 2. Add the delivery hooks to `~/.claude/settings.json`
 
-### 3. Run Claude Code with the channel
-
-```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-peers
+```jsonc
+{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "/path/to/bun /Users/you/claude-peers-mcp/hooks/deliver.ts", "timeout": 10 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "/path/to/bun /Users/you/claude-peers-mcp/hooks/deliver.ts", "timeout": 10 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "/path/to/bun /Users/you/claude-peers-mcp/hooks/deliver.ts", "timeout": 10 }] }
+    ],
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "/path/to/bun /Users/you/claude-peers-mcp/hooks/deliver.ts", "timeout": 10 }] }
+    ]
+  }
+}
 ```
 
-That's it. The broker daemon starts automatically the first time.
+That's it. Start Claude Code normally — the broker daemon auto-launches. Ask any session to "list peers" or "send a message to multi-baton: …".
 
-> **Tip:** Add it to an alias so you don't have to type it every time:
->
-> ```bash
-> alias claudepeers='claude --dangerously-load-development-channels server:claude-peers'
-> ```
+## Tools
 
-### 4. Open a second session and try it
-
-In another terminal, start Claude Code the same way. Then ask either one:
-
-> List all peers on this machine
-
-It'll show every running instance with their working directory, git repo, and a summary of what they're doing. Then:
-
-> Send a message to peer [id]: "what are you working on?"
-
-The other Claude receives it immediately and responds.
-
-## What Claude can do
-
-| Tool             | What it does                                                                   |
-| ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
-| `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
-| `set_summary`    | Describe what you're working on (visible to other peers)                       |
-| `check_messages` | Manually check for messages (fallback if not using channel mode)               |
+| Tool             | What it does                                                                      |
+| ---------------- | --------------------------------------------------------------------------------- |
+| `list_peers`     | Find other instances by `machine` / `directory` / `repo`, with names and backlog  |
+| `send_message`   | Queue a message for a peer by **name or ID**; returns a `message_id`              |
+| `message_status` | Check if a sent message is still `queued` or was `delivered` (and when)           |
+| `set_summary`    | Describe what you're working on (visible to other peers)                          |
+| `check_messages` | Manually pull queued mail (a real fallback now — nothing is consumed behind you)  |
 
 ## How it works
 
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and polls for messages every second. Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees them immediately.
-
 ```
-                    ┌───────────────────────────┐
-                    │  broker daemon            │
-                    │  localhost:7899 + SQLite  │
-                    └──────┬───────────────┬────┘
-                           │               │
-                      MCP server A    MCP server B
-                      (stdio)         (stdio)
-                           │               │
-                      Claude A         Claude B
+                 ┌────────────────────────────────┐
+                 │  broker daemon                 │
+                 │  localhost:7899 + SQLite queue │
+                 └──┬──────────▲───────▲──────────┘
+        register/   │          │ send  │ /consume (atomic,
+        heartbeat   │          │       │  marks delivered)
+                    │          │       │
+              MCP server A   MCP srv B │
+               (stdio)        (stdio)  │
+                    │          │       │
+               Claude A     Claude B ◄─┴─ hooks/deliver.ts
+                                          (PostToolUse / Stop /
+                                           UserPromptSubmit / SessionStart)
 ```
 
-The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
+- **`broker.ts`** — singleton HTTP daemon, localhost-only, SQLite-backed. Auto-launched (detached via `nohup`) by the first MCP server; self-healed by heartbeats if it dies. Old v1 `/poll-messages` clients get an empty list so they can't destroy mail.
+- **`server.ts`** — one per session. Registers (recording the parent Claude PID), heartbeats, exposes tools. Does **not** touch inbound mail.
+- **`hooks/deliver.ts`** — the delivery path. Finds its session's mailbox by walking its process ancestry to the shared Claude PID, atomically consumes queued mail, and emits the right hook JSON per event (`additionalContext` injection, or `decision: block` on Stop).
 
-## Auto-summary
+### Details that bit us (so they're handled)
 
-If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `list_peers`.
-
-Without the API key, Claude sets its own summary via the `set_summary` tool.
+- `process.kill(pid, 0)` throwing `EPERM` means the process **exists** (e.g. sandboxed callers) — only `ESRCH` means dead. Treating any throw as "dead" wipes live peers.
+- `lsof -ti :7899` lists **clients** of the port too, not just the listener. Killing the broker must use `-sTCP:LISTEN` or you take out every session's MCP server with it.
+- Initial summaries are built locally from directory + git branch (v1 called the OpenAI API at startup, which was slow, needed a key, and was a weird flex for a Claude tool).
 
 ## CLI
-
-You can also inspect and interact from the command line:
 
 ```bash
 cd ~/claude-peers-mcp
 
-bun cli.ts status            # broker status + all peers
-bun cli.ts peers             # list peers
-bun cli.ts send <id> <msg>   # send a message into a Claude session
-bun cli.ts kill-broker       # stop the broker
+bun cli.ts status              # broker status + all peers
+bun cli.ts peers               # list peers
+bun cli.ts send <name> <msg>   # send a message into a Claude session (by name or id)
+bun cli.ts kill-broker         # stop the broker (listener only!)
 ```
 
 ## Configuration
 
-| Environment variable | Default              | Description                           |
-| -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| Environment variable | Default              | Description          |
+| -------------------- | -------------------- | -------------------- |
+| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port          |
+| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path |
 
 ## Requirements
 
 - [Bun](https://bun.sh)
-- Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
+- Claude Code (any recent version — no experimental flags, no channel support needed)
+
+## Known limits
+
+- A **fully idle** session (no running turn, user away) can't be woken from outside; its mail waits, and the broker raises a macOS notification after 90s so the human can poke it. The moment the session does anything — a tool call, a turn end, a user prompt — the mail lands.
+- Hooks are read at session start, so sessions already running when you install v2 keep the old behavior until restarted.

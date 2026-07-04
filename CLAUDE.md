@@ -4,31 +4,35 @@ globs: "*.ts, *.tsx, *.html, *.css, *.js, *.jsx, package.json"
 alwaysApply: false
 ---
 
-# claude-peers
+# claude-peers (v2)
 
-Peer discovery and messaging MCP channel for Claude Code instances.
+Peer discovery and reliable messaging between Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite message queue. Auto-launched (detached) by the MCP server. Messages stay `queued` until atomically consumed at injection time.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Registers (with parent Claude PID), heartbeats, exposes tools. Does NOT deliver inbound mail.
+- `hooks/deliver.ts` — Delivery hook, wired into ~/.claude/settings.json on PostToolUse / Stop / UserPromptSubmit / SessionStart. Finds its session's mailbox via process ancestry, consumes queued mail, injects it as hook context (or blocks Stop until the session replies).
 - `shared/types.ts` — Shared TypeScript types for broker API.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- `shared/summarize.ts` — Local git-context helpers (no external APIs).
 - `cli.ts` — CLI utility for inspecting broker state.
+
+## Gotchas (learned the hard way)
+
+- `process.kill(pid, 0)`: only ESRCH means dead; EPERM means alive-but-unsignalable (sandboxes). See `processAlive()` in broker.ts.
+- Killing the broker by port MUST use `lsof -ti tcp:7899 -sTCP:LISTEN` — without `-sTCP:LISTEN`, lsof also returns every client connected to the port (all sessions' MCP servers).
+- Hooks are snapshotted at session start; running sessions don't pick up hook changes.
+- v1's `/poll-messages` is kept as a deprecated endpoint returning `[]` so lingering v1 servers can't consume (destroy) queued mail.
 
 ## Running
 
 ```bash
-# Start Claude Code with the channel:
-claude --dangerously-load-development-channels server:claude-peers
-
-# Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
-# { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+# Normal usage: registered as user-scope MCP + hooks in ~/.claude/settings.json (see README)
 
 # CLI:
 bun cli.ts status
 bun cli.ts peers
-bun cli.ts send <peer-id> <message>
+bun cli.ts send <name-or-id> <message>
 bun cli.ts kill-broker
 ```
 

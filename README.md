@@ -13,6 +13,8 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
   └────────────────────────┘         └──────────────────────────┘
 ```
 
+> **Credit:** v1 was created by [Louis Arge](https://github.com/louislva/claude-peers-mcp) — the broker + MCP architecture and the whole idea of peer-discovering Claude sessions are his. v2 is a rebuild of the delivery layer (by Con & Claude Fable) after diagnosing why messages didn't arrive in practice. Original commit history is preserved in this repo.
+
 ## Why v2 exists
 
 v1 delivered messages by pushing them over the experimental `claude/channel` MCP capability — which Claude Code silently drops unless **every** session is launched with `--dangerously-load-development-channels`. Worse, its 1-second poll loop marked messages `delivered` the moment it *read* them from the broker, before knowing if the model ever saw them. Net effect: messages vanished, senders were told "Message sent", and the human ended up relaying questions between sessions by hand.

@@ -4,6 +4,7 @@ export type PeerId = string;
 export interface Peer {
   id: PeerId;
   name: string;
+  host: string; // machine label ("desktop", "laptop", "ultra")
   pid: number;
   claude_pid: number | null;
   cwd: string;
@@ -38,6 +39,7 @@ export interface DeliveredMessage extends Message {
 export interface RegisterRequest {
   pid: number;
   claude_pid: number | null;
+  host?: string; // machine label; broker defaults to its own host if absent
   cwd: string;
   git_root: string | null;
   tty: string | null;
@@ -91,6 +93,7 @@ export interface ConsumeResponse {
 
 export interface FindPeerRequest {
   claude_pids: number[];
+  host?: string; // required in hub mode: PIDs collide across machines
 }
 
 export interface MessageStatusRequest {

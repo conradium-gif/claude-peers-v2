@@ -20,6 +20,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { loadConfig, hostLabel } from "./shared/config.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -37,11 +38,17 @@ import type {
   DeliveredMessage,
 } from "./shared/types.ts";
 
-export const BROKER_VERSION = "0.2.0";
+export const BROKER_VERSION = "0.3.0";
 
+const CONFIG = loadConfig();
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BIND = process.env.CLAUDE_PEERS_BIND ?? CONFIG.bind ?? "127.0.0.1";
+const TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? CONFIG.token ?? null;
+const MY_HOST = hostLabel(CONFIG);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 const STALE_NOTIFY_MS = 90_000;
+// Remote peers can't be PID-checked; they're alive while heartbeating (15s cadence)
+const REMOTE_STALE_MS = 75_000;
 
 // --- Database setup ---
 
@@ -82,6 +89,10 @@ function ensureColumn(table: string, col: string, ddl: string) {
 }
 ensureColumn("peers", "name", "name TEXT NOT NULL DEFAULT ''");
 ensureColumn("peers", "claude_pid", "claude_pid INTEGER");
+ensureColumn("peers", "host", "host TEXT NOT NULL DEFAULT ''");
+
+// Peers registered before hosts existed are local to this broker
+db.run("UPDATE peers SET host = ? WHERE host = ''", [MY_HOST]);
 ensureColumn("messages", "status", "status TEXT NOT NULL DEFAULT 'queued'");
 ensureColumn("messages", "delivered_at", "delivered_at TEXT");
 ensureColumn("messages", "notified", "notified INTEGER NOT NULL DEFAULT 0");
@@ -136,10 +147,21 @@ function processAlive(pid: number): boolean {
   }
 }
 
+function peerAlive(peer: { pid: number; host: string; last_seen: string }): boolean {
+  if (peer.host === MY_HOST) return processAlive(peer.pid);
+  // Remote peer: judged by heartbeat freshness
+  return Date.now() - new Date(peer.last_seen).getTime() < REMOTE_STALE_MS;
+}
+
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const peers = db.query("SELECT id, pid, host, last_seen FROM peers").all() as {
+    id: string;
+    pid: number;
+    host: string;
+    last_seen: string;
+  }[];
   for (const peer of peers) {
-    if (!processAlive(peer.pid)) {
+    if (!peerAlive(peer)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND status = 'queued'", [peer.id]);
     }
@@ -188,18 +210,21 @@ function generateId(): string {
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
+  const host = (body.host || MY_HOST).toLowerCase();
   const name = uniqueName(baseName(body));
 
-  // Re-registration: same MCP-server PID, or same parent Claude process
-  // (MCP server was restarted). Migrate queued mail to the new identity.
+  // Re-registration: same MCP-server PID or same parent Claude process ON
+  // THE SAME HOST (PIDs collide across machines). Migrate queued mail.
   const existing = db
-    .query("SELECT id FROM peers WHERE pid = ?1 OR (claude_pid IS NOT NULL AND claude_pid = ?2)")
-    .all(body.pid, body.claude_pid) as { id: string }[];
+    .query(
+      "SELECT id FROM peers WHERE host = ?1 AND (pid = ?2 OR (claude_pid IS NOT NULL AND claude_pid = ?3))"
+    )
+    .all(host, body.pid, body.claude_pid) as { id: string }[];
 
   db.run(
-    `INSERT INTO peers (id, name, pid, claude_pid, cwd, git_root, tty, summary, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, name, body.pid, body.claude_pid, body.cwd, body.git_root, body.tty, body.summary, now, now]
+    `INSERT INTO peers (id, name, pid, claude_pid, host, cwd, git_root, tty, summary, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, name, body.pid, body.claude_pid, host, body.cwd, body.git_root, body.tty, body.summary, now, now]
   );
 
   for (const old of existing) {
@@ -250,9 +275,9 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Verify each peer is still alive (PID check locally, heartbeat freshness remotely)
   peers = peers.filter((p) => {
-    if (processAlive(p.pid)) return true;
+    if (peerAlive(p as unknown as { pid: number; host: string; last_seen: string })) return true;
     db.run("DELETE FROM peers WHERE id = ?", [p.id]);
     return false;
   });
@@ -265,12 +290,22 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResponse {
   const to = body.to ?? (body as unknown as { to_id?: string }).to_id;
   if (!to) return { ok: false, error: "Missing 'to' (peer id or name)" };
 
-  const target = db
-    .query("SELECT id, name, last_seen FROM peers WHERE id = ?1 OR lower(name) = lower(?1)")
-    .get(to) as { id: string; name: string; last_seen: string } | null;
+  // Accept "id", "name", or "name@host"
+  const [namePart, hostPart] = to.split("@");
+  const target = (
+    hostPart
+      ? db
+          .query(
+            "SELECT id, name, host, last_seen FROM peers WHERE lower(name) = lower(?1) AND lower(host) = lower(?2)"
+          )
+          .get(namePart, hostPart)
+      : db
+          .query("SELECT id, name, host, last_seen FROM peers WHERE id = ?1 OR lower(name) = lower(?1)")
+          .get(to)
+  ) as { id: string; name: string; host: string; last_seen: string } | null;
   if (!target) {
-    const names = (db.query("SELECT name FROM peers").all() as { name: string }[])
-      .map((r) => r.name)
+    const names = (db.query("SELECT name, host FROM peers").all() as { name: string; host: string }[])
+      .map((r) => `${r.name}@${r.host}`)
       .join(", ");
     return { ok: false, error: `Peer "${to}" not found. Known peers: ${names || "(none)"}` };
   }
@@ -323,10 +358,12 @@ function handleConsume(body: ConsumeRequest): ConsumeResponse {
  */
 function handleFindPeer(body: FindPeerRequest): { peer: Peer | null } {
   if (!body.claude_pids?.length) return { peer: null };
+  const host = (body.host || MY_HOST).toLowerCase();
   const placeholders = body.claude_pids.map(() => "?").join(",");
+  // Host scoping is required: PIDs collide across machines
   const peer = db
-    .query(`SELECT * FROM peers WHERE claude_pid IN (${placeholders}) LIMIT 1`)
-    .get(...body.claude_pids) as Peer | null;
+    .query(`SELECT * FROM peers WHERE host = ? AND claude_pid IN (${placeholders}) LIMIT 1`)
+    .get(host, ...body.claude_pids) as Peer | null;
   return { peer };
 }
 
@@ -351,17 +388,30 @@ function handleUnregister(body: { id: string }): void {
 
 Bun.serve({
   port: PORT,
-  hostname: "127.0.0.1",
-  async fetch(req) {
+  hostname: BIND,
+  async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
 
     if (req.method !== "POST") {
       if (path === "/health") {
         const count = (db.query("SELECT COUNT(*) AS n FROM peers").get() as { n: number }).n;
-        return Response.json({ status: "ok", version: BROKER_VERSION, peers: count });
+        return Response.json({ status: "ok", version: BROKER_VERSION, host: MY_HOST, peers: count });
       }
       return new Response(`claude-peers broker v${BROKER_VERSION}`, { status: 200 });
+    }
+
+    // Non-loopback requests must present the shared token (when configured).
+    // Loopback stays exempt so local components work before config exists.
+    const ip = server.requestIP(req)?.address ?? "";
+    const isLoopback = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
+    if (!isLoopback) {
+      if (!TOKEN) {
+        return Response.json({ error: "remote access disabled (no token configured)" }, { status: 403 });
+      }
+      if (req.headers.get("authorization") !== `Bearer ${TOKEN}`) {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
     }
 
     try {
@@ -407,4 +457,6 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-peers broker] v${BROKER_VERSION} listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+console.error(
+  `[claude-peers broker] v${BROKER_VERSION} host=${MY_HOST} listening on ${BIND}:${PORT} (db: ${DB_PATH}, token: ${TOKEN ? "set" : "none — loopback only"})`
+);

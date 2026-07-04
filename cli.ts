@@ -11,17 +11,20 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
+import { loadConfig, brokerUrl, authHeaders } from "./shared/config.ts";
+
+const CONFIG = loadConfig();
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_URL = brokerUrl(CONFIG);
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
     ? {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders(CONFIG) },
         body: JSON.stringify(body),
       }
-    : {};
+    : { headers: { ...authHeaders(CONFIG) } };
   const res = await fetch(`${BROKER_URL}${path}`, {
     ...opts,
     signal: AbortSignal.timeout(3000),

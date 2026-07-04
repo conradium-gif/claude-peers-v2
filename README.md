@@ -115,12 +115,45 @@ bun cli.ts send <name> <msg>   # send a message into a Claude session (by name o
 bun cli.ts kill-broker         # stop the broker (listener only!)
 ```
 
+## Hub mode — one peers network across multiple machines (v2.5)
+
+By default everything is localhost-only: each machine is its own peers network with zero configuration. Hub mode connects them: run the broker on one always-on machine (bound to a private network address — Tailscale is ideal) and point every machine's components at it. Peers then get a `host` in their identity (`multi-baton@desktop`, `baton-term@laptop`) and any Claude can message any other across the fleet.
+
+Create `~/.claude-peers.json` on each machine (this file is used instead of env vars because macOS GUI-spawned hooks don't reliably inherit shell environments):
+
+**On the hub machine** (runs the broker; also a client of itself):
+
+```json
+{
+  "bind": "100.x.y.z",
+  "broker_url": "http://100.x.y.z:7899",
+  "token": "<shared secret, e.g. openssl rand -hex 16>",
+  "host": "ultra"
+}
+```
+
+**On every other machine:**
+
+```json
+{
+  "broker_url": "http://100.x.y.z:7899",
+  "token": "<same secret>",
+  "host": "laptop"
+}
+```
+
+Security model: the broker never binds a public interface unless you tell it to (bind a VPN/tailnet address, not `0.0.0.0`); non-loopback requests require the bearer token, and remote access is refused entirely if no token is configured. Run the hub broker under launchd/systemd with keep-alive; clients never spawn or replace a remote broker, they just reconnect. Remote peers are judged alive by heartbeat freshness (local ones by PID). Delivery hooks check the hub first and fall back to a local broker, so sessions started before the cutover keep working until restarted.
+
 ## Configuration
 
 | Environment variable | Default              | Description          |
 | -------------------- | -------------------- | -------------------- |
 | `CLAUDE_PEERS_PORT`  | `7899`               | Broker port          |
 | `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path |
+| `CLAUDE_PEERS_BROKER_URL` | from config file / localhost | Broker to connect to (overrides `~/.claude-peers.json`) |
+| `CLAUDE_PEERS_BIND`  | from config file / `127.0.0.1` | Broker listen address |
+| `CLAUDE_PEERS_TOKEN` | from config file     | Shared secret for non-loopback requests |
+| `CLAUDE_PEERS_HOST`  | short hostname       | Machine label in peer identity |
 
 ## Requirements
 

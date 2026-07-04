@@ -1,0 +1,72 @@
+/**
+ * Fleet configuration for claude-peers.
+ *
+ * Loaded from ~/.claude-peers.json (env vars override). Absent file =
+ * pure localhost mode, identical to v2 behavior.
+ *
+ * Example hub setup (machine pointing at a broker on an always-on server):
+ *   { "broker_url": "http://100.x.y.z:7899", "token": "…", "host": "laptop" }
+ *
+ * Example hub server (the broker machine itself):
+ *   { "bind": "100.x.y.z", "token": "…", "host": "ultra" }
+ *
+ * A config file lives per machine — NOT in the repo — because hooks and
+ * GUI-spawned MCP servers on macOS don't reliably inherit shell env vars.
+ */
+
+import { readFileSync } from "node:fs";
+
+export interface PeersConfig {
+  broker_url?: string; // where clients (server.ts, hooks) reach the broker
+  token?: string; // shared secret; required by the broker for non-loopback requests
+  host?: string; // friendly machine label ("desktop", "laptop", "ultra")
+  bind?: string; // broker only: address to listen on (default 127.0.0.1)
+}
+
+export function loadConfig(): PeersConfig {
+  try {
+    const raw = readFileSync(`${process.env.HOME}/.claude-peers.json`, "utf8");
+    return JSON.parse(raw) as PeersConfig;
+  } catch {
+    return {};
+  }
+}
+
+export function shortHostname(): string {
+  try {
+    const out = Bun.spawnSync(["hostname", "-s"]).stdout;
+    const name = new TextDecoder().decode(out).trim().toLowerCase();
+    return name || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+export function hostLabel(config: PeersConfig): string {
+  return (config.host ?? process.env.CLAUDE_PEERS_HOST ?? shortHostname())
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-");
+}
+
+export function brokerUrl(config: PeersConfig): string {
+  const port = process.env.CLAUDE_PEERS_PORT ?? "7899";
+  return (
+    process.env.CLAUDE_PEERS_BROKER_URL ??
+    config.broker_url ??
+    `http://127.0.0.1:${port}`
+  ).replace(/\/+$/, "");
+}
+
+export function isRemoteBroker(url: string): boolean {
+  try {
+    const h = new URL(url).hostname;
+    return h !== "127.0.0.1" && h !== "localhost" && h !== "::1";
+  } catch {
+    return false;
+  }
+}
+
+export function authHeaders(config: PeersConfig): Record<string, string> {
+  const token = process.env.CLAUDE_PEERS_TOKEN ?? config.token;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}

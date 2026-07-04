@@ -31,21 +31,31 @@ import type {
   MessageStatusResponse,
 } from "./shared/types.ts";
 import { getGitBranch } from "./shared/summarize.ts";
+import {
+  loadConfig,
+  hostLabel,
+  brokerUrl,
+  isRemoteBroker,
+  authHeaders,
+} from "./shared/config.ts";
 
 // --- Configuration ---
 
+const CONFIG = loadConfig();
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_URL = brokerUrl(CONFIG);
+const REMOTE_BROKER = isRemoteBroker(BROKER_URL);
+const MY_HOST = hostLabel(CONFIG);
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
-const EXPECTED_BROKER_VERSION = "0.2.0";
+const EXPECTED_BROKER_VERSION = "0.3.0";
 
 // --- Broker communication ---
 
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders(CONFIG) },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(5000),
   });
@@ -72,6 +82,19 @@ async function ensureBroker(): Promise<void> {
   if (v === EXPECTED_BROKER_VERSION) {
     log("Broker already running");
     return;
+  }
+
+  if (REMOTE_BROKER) {
+    // Hub mode: the broker lives on another machine — we never spawn or
+    // replace it from here. Wait briefly in case it's coming up.
+    for (let i = 0; i < 10; i++) {
+      if ((await brokerVersion()) !== null) {
+        log(`Connected to remote broker at ${BROKER_URL}`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`Remote broker unreachable at ${BROKER_URL}`);
   }
 
   if (v !== null) {
@@ -195,7 +218,7 @@ const TOOLS = [
           type: "string" as const,
           enum: ["machine", "directory", "repo"],
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer (default). "directory" = same working directory. "repo" = same git repository.',
+            'Scope of peer discovery. "machine" = every instance on your peers network — the whole fleet when using a hub broker (default). "directory" = same working directory. "repo" = same git repository.',
         },
       },
     },
@@ -209,7 +232,8 @@ const TOOLS = [
       properties: {
         to: {
           type: "string" as const,
-          description: 'Target peer name (e.g. "multi-baton") or peer ID (from list_peers)',
+          description:
+            'Target peer name (e.g. "multi-baton"), name@host (e.g. "multi-baton@desktop") if names collide across machines, or peer ID (from list_peers)',
         },
         message: {
           type: "string" as const,
@@ -293,7 +317,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const lines = peers.map((p) => {
           const parts = [
-            `Name: ${p.name}  (ID: ${p.id})`,
+            `Name: ${p.name}@${p.host}  (ID: ${p.id})`,
             `CWD: ${p.cwd}`,
           ];
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
@@ -304,7 +328,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         });
 
         return textResult(
-          `You are "${myName}" (ID: ${myId}). Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`
+          `You are "${myName}@${MY_HOST}" (ID: ${myId}). Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`
         );
       } catch (e) {
         return textResult(
@@ -432,6 +456,7 @@ async function main() {
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     claude_pid: process.ppid || null,
+    host: MY_HOST,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
@@ -439,7 +464,7 @@ async function main() {
   });
   myId = reg.id;
   myName = reg.name;
-  log(`Registered as peer "${myName}" (${myId})`);
+  log(`Registered as peer "${myName}@${MY_HOST}" (${myId}) via ${BROKER_URL}`);
 
   // 4. Connect MCP over stdio
   await mcp.connect(new StdioServerTransport());
@@ -462,6 +487,7 @@ async function main() {
           const reg = await brokerFetch<RegisterResponse>("/register", {
             pid: process.pid,
             claude_pid: process.ppid || null,
+            host: MY_HOST,
             cwd: myCwd,
             git_root: myGitRoot,
             tty: getTty(),

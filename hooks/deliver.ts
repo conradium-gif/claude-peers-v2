@@ -23,8 +23,16 @@
  * isn't registered (yet), we exit silently and mail stays queued.
  */
 
+import { loadConfig, hostLabel, brokerUrl, isRemoteBroker, authHeaders } from "../shared/config.ts";
+
+const CONFIG = loadConfig();
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const HUB_URL = brokerUrl(CONFIG);
+const LOCAL_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const MY_HOST = hostLabel(CONFIG);
+// Hub first; if this session isn't registered there (e.g. its MCP server
+// predates hub mode and registered locally), fall back to the local broker.
+const BROKER_URLS = isRemoteBroker(HUB_URL) ? [HUB_URL, LOCAL_URL] : [HUB_URL];
 
 interface HookInput {
   hook_event_name?: string;
@@ -33,11 +41,11 @@ interface HookInput {
   stop_hook_active?: boolean;
 }
 
-async function post<T>(path: string, body: unknown): Promise<T | null> {
+async function post<T>(base: string, path: string, body: unknown): Promise<T | null> {
   try {
-    const res = await fetch(`${BROKER_URL}${path}`, {
+    const res = await fetch(`${base}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders(CONFIG) },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(1500),
     });
@@ -92,15 +100,21 @@ async function main() {
   }
   const event = input.hook_event_name ?? process.argv[2] ?? "unknown";
 
-  // Identify this session's peer via shared ancestor (the Claude process)
-  const found = await post<{ peer: { id: string } | null }>("/find-peer", {
-    claude_pids: ancestorPids(),
-  });
-  if (!found?.peer) return; // not a peers-registered session (or broker down)
-
-  const consumed = await post<{
+  // Identify this session's peer via shared ancestor (the Claude process),
+  // checking the hub first and the local broker as a transition fallback.
+  const pids = ancestorPids();
+  let consumed: {
     messages: { from_id: string; from_name: string; from_cwd: string; text: string; sent_at: string }[];
-  }>("/consume", { peer_id: found.peer.id });
+  } | null = null;
+  for (const base of BROKER_URLS) {
+    const found = await post<{ peer: { id: string } | null }>(base, "/find-peer", {
+      claude_pids: pids,
+      host: MY_HOST,
+    });
+    if (!found?.peer) continue;
+    consumed = await post(base, "/consume", { peer_id: found.peer.id });
+    if (consumed) break;
+  }
   if (!consumed || consumed.messages.length === 0) return; // nothing queued → hook is a no-op
 
   const text = formatMessages(consumed.messages);

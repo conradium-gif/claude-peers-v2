@@ -23,9 +23,17 @@
  * isn't registered (yet), we exit silently and mail stays queued.
  */
 
-import { loadConfig, hostLabel, brokerUrl, isRemoteBroker, authHeaders } from "../shared/config.ts";
+import {
+  loadConfig,
+  hostLabel,
+  machineId,
+  brokerUrl,
+  isRemoteBroker,
+  authHeaders,
+} from "../shared/config.ts";
 
 const CONFIG = loadConfig();
+const MY_MACHINE = machineId();
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const HUB_URL = brokerUrl(CONFIG);
 const LOCAL_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -110,6 +118,7 @@ async function main() {
     const found = await post<{ peer: { id: string } | null }>(base, "/find-peer", {
       claude_pids: pids,
       host: MY_HOST,
+      machine_id: MY_MACHINE,
     });
     if (!found?.peer) continue;
     consumed = await post(base, "/consume", { peer_id: found.peer.id });

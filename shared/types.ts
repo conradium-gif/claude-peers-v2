@@ -4,7 +4,8 @@ export type PeerId = string;
 export interface Peer {
   id: PeerId;
   name: string;
-  host: string; // machine label ("desktop", "laptop", "ultra")
+  host: string; // friendly machine label ("desktop") — display/addressing only
+  machine_id: string; // stable machine UUID — the real identity key
   pid: number;
   claude_pid: number | null;
   cwd: string;
@@ -16,7 +17,7 @@ export interface Peer {
   pending?: number; // queued messages waiting for this peer
 }
 
-export type MessageStatus = "queued" | "delivered";
+export type MessageStatus = "queued" | "delivered" | "expired";
 
 export interface Message {
   id: number;
@@ -40,6 +41,7 @@ export interface RegisterRequest {
   pid: number;
   claude_pid: number | null;
   host?: string; // machine label; broker defaults to its own host if absent
+  machine_id?: string; // stable machine UUID (absent from pre-0.3.1 clients)
   cwd: string;
   git_root: string | null;
   tty: string | null;
@@ -93,7 +95,8 @@ export interface ConsumeResponse {
 
 export interface FindPeerRequest {
   claude_pids: number[];
-  host?: string; // required in hub mode: PIDs collide across machines
+  host?: string; // legacy fallback match for pre-machine-id registrations
+  machine_id?: string; // primary scoping key: PIDs collide across machines
 }
 
 export interface MessageStatusRequest {

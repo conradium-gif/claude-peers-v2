@@ -20,7 +20,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { loadConfig, hostLabel } from "./shared/config.ts";
+import { loadConfig, hostLabel, machineId } from "./shared/config.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -38,13 +38,17 @@ import type {
   DeliveredMessage,
 } from "./shared/types.ts";
 
-export const BROKER_VERSION = "0.3.0";
+export const BROKER_VERSION = "0.3.1";
 
 const CONFIG = loadConfig();
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BIND = process.env.CLAUDE_PEERS_BIND ?? CONFIG.bind ?? "127.0.0.1";
+const IS_LOOPBACK_BROKER = BIND === "127.0.0.1" || BIND === "localhost" || BIND === "::1";
 const TOKEN = process.env.CLAUDE_PEERS_TOKEN ?? CONFIG.token ?? null;
 const MY_HOST = hostLabel(CONFIG);
+const MY_MACHINE = machineId();
+// Queued mail older than this expires (dead-letter) instead of sitting forever
+const MESSAGE_TTL_MS = 48 * 3600_000;
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 const STALE_NOTIFY_MS = 90_000;
 // Remote peers can't be PID-checked; they're alive while heartbeating (15s cadence)
@@ -90,9 +94,22 @@ function ensureColumn(table: string, col: string, ddl: string) {
 ensureColumn("peers", "name", "name TEXT NOT NULL DEFAULT ''");
 ensureColumn("peers", "claude_pid", "claude_pid INTEGER");
 ensureColumn("peers", "host", "host TEXT NOT NULL DEFAULT ''");
+ensureColumn("peers", "machine_id", "machine_id TEXT NOT NULL DEFAULT ''");
 
 // Peers registered before hosts existed are local to this broker
 db.run("UPDATE peers SET host = ? WHERE host = ''", [MY_HOST]);
+
+// Self-heal legacy registrations. On a loopback-only broker EVERY peer is
+// this machine by definition, so rows from pre-machine-id clients (or from
+// before a config file renamed the host label) can be safely claimed.
+// Without this, a host-label change strands their queued mail — real
+// incident: sessions registered under the raw hostname, a new config said
+// "desktop", and delivery hooks stopped matching their mailboxes.
+function adoptLegacyLocalPeers() {
+  if (!IS_LOOPBACK_BROKER) return;
+  db.run("UPDATE peers SET machine_id = ?, host = ? WHERE machine_id = ''", [MY_MACHINE, MY_HOST]);
+}
+adoptLegacyLocalPeers();
 ensureColumn("messages", "status", "status TEXT NOT NULL DEFAULT 'queued'");
 ensureColumn("messages", "delivered_at", "delivered_at TEXT");
 ensureColumn("messages", "notified", "notified INTEGER NOT NULL DEFAULT 0");
@@ -147,17 +164,22 @@ function processAlive(pid: number): boolean {
   }
 }
 
-function peerAlive(peer: { pid: number; host: string; last_seen: string }): boolean {
-  if (peer.host === MY_HOST) return processAlive(peer.pid);
+function peerAlive(peer: { pid: number; host: string; machine_id: string; last_seen: string }): boolean {
+  // Same machine as the broker (by stable id, or legacy label match) → PID check
+  if (peer.machine_id === MY_MACHINE || (peer.machine_id === "" && peer.host === MY_HOST)) {
+    return processAlive(peer.pid);
+  }
   // Remote peer: judged by heartbeat freshness
   return Date.now() - new Date(peer.last_seen).getTime() < REMOTE_STALE_MS;
 }
 
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid, host, last_seen FROM peers").all() as {
+  adoptLegacyLocalPeers(); // late registrations from pre-0.3.1 clients
+  const peers = db.query("SELECT id, pid, host, machine_id, last_seen FROM peers").all() as {
     id: string;
     pid: number;
     host: string;
+    machine_id: string;
     last_seen: string;
   }[];
   for (const peer of peers) {
@@ -166,6 +188,10 @@ function cleanStalePeers() {
       db.run("DELETE FROM messages WHERE to_id = ? AND status = 'queued'", [peer.id]);
     }
   }
+  // Dead-letter: expire mail that has sat queued past the TTL, so senders
+  // see an honest terminal status instead of an eternal "queued".
+  const cutoff = new Date(Date.now() - MESSAGE_TTL_MS).toISOString();
+  db.run("UPDATE messages SET status = 'expired' WHERE status = 'queued' AND sent_at < ?", [cutoff]);
 }
 
 cleanStalePeers();
@@ -211,20 +237,35 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   const id = generateId();
   const now = new Date().toISOString();
   const host = (body.host || MY_HOST).toLowerCase();
+  const machine = body.machine_id ?? "";
   const name = uniqueName(baseName(body));
 
-  // Re-registration: same MCP-server PID or same parent Claude process ON
-  // THE SAME HOST (PIDs collide across machines). Migrate queued mail.
+  // Keep the friendly label consistent fleet-wide: a machine's label is
+  // whatever its newest registration says (labels are display-only; the
+  // machine_id is the identity).
+  if (machine) {
+    db.run("UPDATE peers SET host = ? WHERE machine_id = ? AND host != ?", [host, machine, host]);
+  }
+
+  // Re-registration: same MCP-server PID or same parent Claude process on
+  // the SAME MACHINE (PIDs collide across machines) — matched by stable
+  // machine_id, with a host-label fallback for pre-0.3.1 rows. Migrate
+  // queued mail to the new identity.
   const existing = db
     .query(
-      "SELECT id FROM peers WHERE host = ?1 AND (pid = ?2 OR (claude_pid IS NOT NULL AND claude_pid = ?3))"
+      `SELECT id FROM peers WHERE
+         (pid = ?1 OR (claude_pid IS NOT NULL AND claude_pid = ?2))
+         AND (
+           (?3 != '' AND machine_id = ?3)
+           OR (machine_id = '' AND host = ?4)
+         )`
     )
-    .all(host, body.pid, body.claude_pid) as { id: string }[];
+    .all(body.pid, body.claude_pid, machine, host) as { id: string }[];
 
   db.run(
-    `INSERT INTO peers (id, name, pid, claude_pid, host, cwd, git_root, tty, summary, registered_at, last_seen)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id, name, body.pid, body.claude_pid, host, body.cwd, body.git_root, body.tty, body.summary, now, now]
+    `INSERT INTO peers (id, name, pid, claude_pid, host, machine_id, cwd, git_root, tty, summary, registered_at, last_seen)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, name, body.pid, body.claude_pid, host, machine, body.cwd, body.git_root, body.tty, body.summary, now, now]
   );
 
   for (const old of existing) {
@@ -359,11 +400,22 @@ function handleConsume(body: ConsumeRequest): ConsumeResponse {
 function handleFindPeer(body: FindPeerRequest): { peer: Peer | null } {
   if (!body.claude_pids?.length) return { peer: null };
   const host = (body.host || MY_HOST).toLowerCase();
+  const machine = body.machine_id ?? "";
   const placeholders = body.claude_pids.map(() => "?").join(",");
-  // Host scoping is required: PIDs collide across machines
+  // Machine scoping is required (PIDs collide across machines) but keyed on
+  // the stable machine_id, NOT the friendly host label — labels can change
+  // (config renames) and must never orphan a mailbox. Host equality remains
+  // only as the fallback for rows from pre-0.3.1 clients.
   const peer = db
-    .query(`SELECT * FROM peers WHERE host = ? AND claude_pid IN (${placeholders}) LIMIT 1`)
-    .get(host, ...body.claude_pids) as Peer | null;
+    .query(
+      `SELECT * FROM peers WHERE claude_pid IN (${placeholders})
+       AND (
+         (? != '' AND machine_id = ?)
+         OR (machine_id = '' AND host = ?)
+       )
+       LIMIT 1`
+    )
+    .get(...body.claude_pids, machine, machine, host) as Peer | null;
   return { peer };
 }
 

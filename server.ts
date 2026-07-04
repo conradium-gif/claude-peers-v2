@@ -34,6 +34,7 @@ import { getGitBranch } from "./shared/summarize.ts";
 import {
   loadConfig,
   hostLabel,
+  machineId,
   brokerUrl,
   isRemoteBroker,
   authHeaders,
@@ -46,9 +47,19 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = brokerUrl(CONFIG);
 const REMOTE_BROKER = isRemoteBroker(BROKER_URL);
 const MY_HOST = hostLabel(CONFIG);
+const MY_MACHINE = machineId();
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
-const EXPECTED_BROKER_VERSION = "0.3.0";
+const EXPECTED_BROKER_VERSION = "0.3.1";
+
+// Accept same-minor brokers at or above our patch level. Exact-match here
+// caused kill/respawn flapping whenever a long-running server (old constant
+// in memory) met a freshly upgraded broker.
+function brokerVersionAcceptable(v: string): boolean {
+  const [maj, min, pat] = v.split(".").map((n) => parseInt(n, 10));
+  const [emaj, emin, epat] = EXPECTED_BROKER_VERSION.split(".").map((n) => parseInt(n, 10));
+  return maj === emaj && min === emin && pat >= epat;
+}
 
 // --- Broker communication ---
 
@@ -79,8 +90,8 @@ async function brokerVersion(): Promise<string | null> {
 
 async function ensureBroker(): Promise<void> {
   const v = await brokerVersion();
-  if (v === EXPECTED_BROKER_VERSION) {
-    log("Broker already running");
+  if (v !== null && brokerVersionAcceptable(v)) {
+    log(`Broker already running (v${v})`);
     return;
   }
 
@@ -125,7 +136,8 @@ async function ensureBroker(): Promise<void> {
 
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 200));
-    if ((await brokerVersion()) === EXPECTED_BROKER_VERSION) {
+    const nv = await brokerVersion();
+    if (nv !== null && brokerVersionAcceptable(nv)) {
       log("Broker started");
       return;
     }
@@ -380,6 +392,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             `Message ${message_id} → "${result.to_name}": DELIVERED at ${result.delivered_at} (injected into their context).`
           );
         }
+        if (result.status === "expired") {
+          return textResult(
+            `Message ${message_id} → "${result.to_name}": EXPIRED undelivered (sent ${result.sent_at}, 48h TTL). Their session was never active while it was queued — resend if still relevant.`
+          );
+        }
         return textResult(
           `Message ${message_id} → "${result.to_name}": still QUEUED (sent ${result.sent_at}). Their session hasn't been active since you sent it.`
         );
@@ -457,6 +474,7 @@ async function main() {
     pid: process.pid,
     claude_pid: process.ppid || null,
     host: MY_HOST,
+    machine_id: MY_MACHINE,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
@@ -488,6 +506,7 @@ async function main() {
             pid: process.pid,
             claude_pid: process.ppid || null,
             host: MY_HOST,
+            machine_id: MY_MACHINE,
             cwd: myCwd,
             git_root: myGitRoot,
             tty: getTty(),

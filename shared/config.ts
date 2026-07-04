@@ -14,7 +14,7 @@
  * GUI-spawned MCP servers on macOS don't reliably inherit shell env vars.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 
 export interface PeersConfig {
   broker_url?: string; // where clients (server.ts, hooks) reach the broker
@@ -30,6 +30,34 @@ export function loadConfig(): PeersConfig {
   } catch {
     return {};
   }
+}
+
+/**
+ * Stable machine identity, independent of the friendly host label.
+ *
+ * The host label ("desktop") is display/addressing sugar and can change —
+ * e.g. when a config file first sets it — and anything keyed on it breaks
+ * for components that registered under the old label (real incident:
+ * running sessions registered as the raw hostname, a later config renamed
+ * the machine, and delivery hooks stopped finding their mailboxes).
+ * This UUID is generated once, persisted, and never changes.
+ */
+export function machineId(): string {
+  const p = `${process.env.HOME}/.claude-peers.machine-id`;
+  try {
+    const id = readFileSync(p, "utf8").trim();
+    if (id) return id;
+  } catch {
+    // first run
+  }
+  const id = crypto.randomUUID();
+  try {
+    writeFileSync(p, id + "\n");
+  } catch {
+    // unwritable home — fall back to a per-process id (delivery degrades
+    // to legacy host matching, nothing breaks)
+  }
+  return id;
 }
 
 export function shortHostname(): string {

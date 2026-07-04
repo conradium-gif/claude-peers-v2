@@ -82,7 +82,7 @@ function formatMessages(
   });
   const replyTo = messages[messages.length - 1];
   return (
-    `📨 claude-peers: incoming message(s) from other Claude Code session(s) on this machine:\n\n` +
+    `📨 claude-peers: incoming message(s) from other Claude Code session(s) on your peers network:\n\n` +
     blocks.join("\n\n") +
     `\n\nReply now using the mcp__claude-peers__send_message tool with to="${replyTo.from_name}" ` +
     `(or the sender's name shown above), then continue what you were doing. ` +

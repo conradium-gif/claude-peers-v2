@@ -38,7 +38,7 @@ import type {
   DeliveredMessage,
 } from "./shared/types.ts";
 
-export const BROKER_VERSION = "0.3.1";
+export const BROKER_VERSION = "0.3.2";
 
 const CONFIG = loadConfig();
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
@@ -49,6 +49,11 @@ const MY_HOST = hostLabel(CONFIG);
 const MY_MACHINE = machineId();
 // Queued mail older than this expires (dead-letter) instead of sitting forever
 const MESSAGE_TTL_MS = 48 * 3600_000;
+// Cap the terminal-message backlog: keep only the N most recent delivered/expired
+// messages so the table can't grow without bound (newest evicts oldest). Queued
+// (unread) mail is NEVER eligible — deleting unread mail would resurrect the v1
+// lost-message bug where mail vanished before it reached a model's context.
+const MESSAGE_KEEP = 10;
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 const STALE_NOTIFY_MS = 90_000;
 // Remote peers can't be PID-checked; they're alive while heartbeating (15s cadence)
@@ -192,6 +197,20 @@ function cleanStalePeers() {
   // see an honest terminal status instead of an eternal "queued".
   const cutoff = new Date(Date.now() - MESSAGE_TTL_MS).toISOString();
   db.run("UPDATE messages SET status = 'expired' WHERE status = 'queued' AND sent_at < ?", [cutoff]);
+  // Retention cap: delivered/expired mail is terminal — never read again — so keep
+  // only the newest MESSAGE_KEEP of it and drop the rest. The status filter on both
+  // the delete and the keep-set means queued mail is untouchable: it can never be
+  // counted toward the cap nor evicted by it.
+  db.run(
+    `DELETE FROM messages
+     WHERE status IN ('delivered', 'expired')
+       AND id NOT IN (
+         SELECT id FROM messages
+         WHERE status IN ('delivered', 'expired')
+         ORDER BY id DESC LIMIT ?
+       )`,
+    [MESSAGE_KEEP]
+  );
 }
 
 cleanStalePeers();
